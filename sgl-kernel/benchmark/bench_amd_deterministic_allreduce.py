@@ -67,9 +67,20 @@ def init_custom_ar_if_available(rank, world_size, device):
 
 def reduce_scatter_then_all_gather(tensor, rank, world_size, custom_ar=None):
     """
-    Deterministic all-reduce using reduce-scatter + all-gather.
-    This is deterministic because it uses fixed ordering (no atomics).
+    Deterministic all-reduce.
+
+    If ``custom_ar`` is provided, run the custom all-reduce kernel (out-of-place)
+    and write the result back into ``tensor`` in place. Otherwise fall back to a
+    reduce-scatter + all-gather built from NCCL/RCCL collectives, which is
+    deterministic because it uses fixed ordering (no atomics).
     """
+    if custom_ar is not None:
+        out = custom_ar.custom_all_reduce(tensor)
+        if out is not None:
+            tensor.copy_(out.view(tensor.shape))
+            return
+        # Custom AR not applicable for this input (size/backend); fall back below.
+
     total_size = tensor.numel()
     if total_size % world_size != 0:
         # Fallback to all-gather + local reduce if not divisible
