@@ -12,6 +12,17 @@ from torch.distributed import ProcessGroup
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 
+# The raw sgl_kernel custom all-reduce ABI differs between CUDA and ROCm:
+#   - CUDA exposes ``init_custom_ar(ipc_tensors, rank_data, rank, full_nvlink)`` plus a
+#     unified ``all_reduce`` and manages shared IPC buffers via libcudart.
+#   - ROCm exposes ``init_custom_ar(meta, rank_data, handles, offsets, rank, full_nvlink)``
+#     with IPC handle/offset exchange plus ``all_reduce_reg`` / ``all_reduce_unreg``, and
+#     there is no ``libcudart`` in the process (only the HIP runtime).
+# So the two platforms need different drivers. On ROCm we exercise the freshly built
+# kernel through the same orchestration used in production (``CustomAllreduce``), still
+# validating the result against the NCCL/RCCL reference.
+_IS_ROCM = torch.version.hip is not None
+
 
 def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes):
     device = torch.device(f"cuda:{rank}")
@@ -63,6 +74,72 @@ def _run_correctness_worker(world_size, rank, distributed_init_port, test_sizes)
         if meta_ptrs:
             TestCustomAllReduce.free_shared_buffer(meta_ptrs, group)
 
+        dist.destroy_process_group(group=group)
+
+
+def _run_correctness_worker_rocm(world_size, rank, distributed_init_port, test_sizes):
+    """ROCm driver for the custom all-reduce kernel.
+
+    ROCm's ``init_custom_ar`` takes IPC handles/offsets (not raw IPC pointers) and uses
+    ``all_reduce_reg`` / ``all_reduce_unreg`` instead of a unified ``all_reduce``. Rather
+    than re-implement that handshake here, drive the freshly built kernel through the same
+    ``CustomAllreduce`` orchestration used in production and validate against RCCL.
+    """
+    from torch.distributed import new_group
+
+    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
+    from sglang.srt.environ import envs
+
+    # Force sglang's 1-stage (deterministic) custom AR path so the kernel is always
+    # selected regardless of the auto-detected xGMI/NVLink topology.
+    envs.SGLANG_USE_1STAGE_ALLREDUCE.set("1")
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    distributed_init_method = f"tcp://localhost:{distributed_init_port}"
+    dist.init_process_group(
+        backend="nccl",
+        init_method=distributed_init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+    group = dist.group.WORLD
+
+    custom_ar = None
+    try:
+        # Custom AR requires a non-NCCL backend for its IPC metadata exchange.
+        dist.barrier(group=group)
+        ar_group = new_group(backend="gloo")
+        dist.barrier(group=group)
+
+        custom_ar = CustomAllreduce(group=ar_group, device=device)
+        assert (
+            custom_ar is not None and not custom_ar.disabled
+        ), "CustomAllreduce is disabled on this ROCm setup"
+
+        test_loop = 10
+        for sz in test_sizes:
+            # ROCm 1-stage kernel operates on bf16/fp16/fp32 tensors.
+            for dtype in [torch.float32, torch.float16, torch.bfloat16]:
+                if sz * torch.tensor([], dtype=dtype).element_size() % 16 != 0:
+                    # custom AR requires byte size to be a multiple of 16
+                    continue
+                for _ in range(test_loop):
+                    inp1 = torch.randint(1, 16, (sz,), dtype=dtype, device=device)
+                    inp1_ref = inp1.clone()
+
+                    out1 = custom_ar.custom_all_reduce(inp1)
+                    assert out1 is not None, "custom_all_reduce returned None"
+
+                    dist.all_reduce(inp1_ref, group=group)
+
+                    torch.testing.assert_close(out1, inp1_ref)
+    finally:
+        dist.barrier(group=group)
+        if custom_ar is not None:
+            custom_ar.close()
         dist.destroy_process_group(group=group)
 
 
@@ -175,8 +252,13 @@ class TestCustomAllReduce(unittest.TestCase):
                 continue
 
             print(f"Running test for world_size={world_size}")
+            worker = (
+                _run_correctness_worker_rocm
+                if _IS_ROCM
+                else _run_correctness_worker
+            )
             multi_process_parallel(
-                world_size, _run_correctness_worker, target_args=(self.test_sizes,)
+                world_size, worker, target_args=(self.test_sizes,)
             )
             print(f"custom allreduce tp = {world_size}: OK")
 
