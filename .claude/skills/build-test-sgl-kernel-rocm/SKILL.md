@@ -89,6 +89,16 @@ Existing ROCm-native allreduce coverage lives in
 `test/registered/jit/test_amd_deterministic_custom_allreduce.py` (determinism) and
 `sgl-kernel/benchmark/bench_amd_deterministic_allreduce.py` (latency).
 
+### Benchmark gotcha
+
+In `bench_amd_deterministic_allreduce.py`, if a "Custom AR" latency looks identical to
+the "RS+AG" row (~4-9x slower than the real kernel), the custom path is falling back to
+NCCL/RCCL reduce-scatter + all-gather instead of running the kernel — confirm
+`reduce_scatter_then_all_gather` actually uses its `custom_ar` argument (call
+`custom_ar.custom_all_reduce(tensor)` when provided). The genuine kernel latency is the
+"Deterministic Kernel" column. Also note the large-batch cliff (e.g. batch 512 / 16 MB
+input hitting `max_size`) is real: it re-registers the buffer each call.
+
 ## Cleanup
 
 ```bash
