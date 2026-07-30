@@ -404,9 +404,13 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(
   P* tmps[ngpus];
 #pragma unroll
   for (int i = 0; i < ngpus; i++) {
-    int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
-    tmps[i] = get_tmp_buf<P>(sg.signals[target]);
+    // Deterministic reduction: accumulate peers in a fixed absolute order
+    // (0..ngpus-1) on every rank, matching cross_device_reduce_1stage, so the
+    // per-element float accumulation order is independent of tensor size.
+    ptrs[i] = (const P*)_dp->ptrs[i];
+    // tmps stay rank-rotated: this only selects which peer's scratch buffer a
+    // partition is scattered to / gathered from, which does not affect the sum.
+    tmps[i] = get_tmp_buf<P>(sg.signals[(rank + i) % ngpus]);
   }
   auto tmp_out = tmps[0];
   start_sync<ngpus>(sg, self_sg, rank);
