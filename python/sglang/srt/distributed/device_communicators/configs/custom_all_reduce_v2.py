@@ -31,18 +31,19 @@ class Range(NamedTuple):
 class Heuristic(NamedTuple):
     """Self-contained algo ranges for one dispatch context (graph or eager).
 
-    Five algos are tried in order of preference (fastest first):
+    Six algos are tried in order of preference (fastest first):
       1. ``1shot_push``:    nbytes <= ``one_shot_push_threshold``
       2. ``2shot_push``:    nbytes <= ``two_shot_push_threshold``
       3. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``
       4. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``
                             (only when multicast is enabled at runtime)
       5. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``
+      6. ``ring_simple``:   nbytes in ``ring_simple.min_bytes..max_bytes``
     Above all of these, the caller falls back to NCCL.
 
     Setting two adjacent thresholds equal effectively disables the middle
-    algo; leaving ``mc`` / ``two_shot_push_threshold`` at the default
-    disables that algo.
+    algo; leaving ``mc`` / ``two_shot_push_threshold`` / ``ring_simple`` at
+    the default disables that algo.
 
     The field order below is the positional layout of the table rows
     (``1shot_push, 1shot_pull, 2shot_pull, mc``); ``two_shot_push_threshold``
@@ -54,6 +55,7 @@ class Heuristic(NamedTuple):
     two_shot_pull_threshold: int
     mc: Range = Range(0, 0)  # default: multicast disabled in this context
     two_shot_push_threshold: int = 0  # default: 2shot_push disabled
+    ring_simple: Range = Range(0, 0)  # default: ring_simple disabled
 
     def max_push_bytes(self, world_size: int) -> int:
         """Per-slot push plane bytes this heuristic needs."""
@@ -84,6 +86,8 @@ class Heuristic(NamedTuple):
                 self.two_shot_push_threshold,
                 two_shot_push_max_bytes(max_push_bytes, world_size),
             ),
+            # streams through its own FIFO, so no workspace bounds it
+            ring_simple=self.ring_simple,
         )
 
 
@@ -107,6 +111,8 @@ class AllReduceConfig(NamedTuple):
       - ``num_push_blocks``: 1shot_push grid (bound to the counter array)
       - ``num_pull_blocks``: 1shot_pull (any mode) and non-mc 2shot_pull
       - ``num_mc_blocks``  : mc 2shot_pull; ``None`` disables multicast
+      - ``num_ring_simple_channels``: ring_simple grid, one channel (ring) per
+                             block
     """
 
     graph: Heuristic
@@ -114,6 +120,7 @@ class AllReduceConfig(NamedTuple):
     num_push_blocks: int
     num_pull_blocks: int
     num_mc_blocks: Optional[int]
+    num_ring_simple_channels: int = 0
 
     def max_push_bytes(self, world_size: int) -> int:
         return max(
@@ -342,26 +349,36 @@ def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
 # and a GEMM before each all-reduce (the serving decode pattern). A grid of one
 # block per CU loses the most under skew; 2shot_push beats 1shot_push from
 # 128 KB and the pull algos at every size; above 8 MB RCCL is faster than a
-# 64-block 2shot_push.
+# 64-block 2shot_push. ring_simple beats the fallback from 48 MB (just above
+# 8 MB at TP2) at TP2-8, graph and eager alike, and ties it at 256 MB - 1 GB.
 @cache
 def _rocm_gfx1250_configs(num_sm: int) -> dict[int, AllReduceConfig]:
-    heuristic = Heuristic(64 * KB, 0, 0, two_shot_push_threshold=8 * MB)
-    default = AllReduceConfig(
-        graph=heuristic,
-        eager=heuristic,
-        num_push_blocks=min(num_sm, 64),
-        num_pull_blocks=32,
-        num_mc_blocks=None,
-    )
-    configs = {world_size: default for world_size in range(2, 9)}
+    def config(ring_min_bytes: int) -> AllReduceConfig:
+        # 4 GB keeps every dtype's element count in 32 bits
+        ring = Range(ring_min_bytes, 4 * 1024 * MB)
+        heuristic = Heuristic(
+            64 * KB, 0, 0, two_shot_push_threshold=8 * MB, ring_simple=ring
+        )
+        return AllReduceConfig(
+            graph=heuristic,
+            eager=heuristic,
+            num_push_blocks=min(num_sm, 64),
+            num_pull_blocks=32,
+            num_mc_blocks=None,
+            # one ring channel per CU
+            num_ring_simple_channels=num_sm,
+        )
+
+    configs = {
+        world_size: config(8 * MB if world_size == 2 else 48 * MB)
+        for world_size in range(2, 9)
+    }
     # 16 ranks span two DPX hosts in one UALink fabric clique. Tuned there with
     # and without a late rank: across hosts 2shot_push pays two fabric hops, so
     # 1shot_push wins to 256 KB, and a block per CU keeps 2shot_push ahead of
     # RCCL to 64 MB.
-    tp16 = heuristic._replace(
-        one_shot_push_threshold=256 * KB, two_shot_push_threshold=64 * MB
-    )
-    configs[16] = default._replace(
+    tp16 = Heuristic(256 * KB, 0, 0, two_shot_push_threshold=64 * MB)
+    configs[16] = configs[8]._replace(
         graph=tp16, eager=tp16, num_push_blocks=min(num_sm, 96)
     )
     return configs

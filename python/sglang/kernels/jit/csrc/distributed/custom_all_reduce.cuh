@@ -1,6 +1,6 @@
 // Custom all-reduce kernels over the decoupled Communicator storage plane.
 //
-// Four algorithms are provided behind one entry point:
+// Five algorithms are provided behind one entry point:
 //   - 1shot_push: lamport-style push of local data to every peer's push
 //     workspace, then a local polling reduce (best at small sizes).
 //   - 2shot_push: the same lamport push, but each chunk goes only to its
@@ -10,6 +10,9 @@
 //     workspaces, a CUDA-graph pointer table, or a multicast address).
 //   - 2shot_pull: reduce-scatter fused with all-gather; each rank reduces its
 //     shard in place so every workspace ends up holding the full result.
+//   - ring_simple (ROCm gfx1250 only): a ring all-reduce; each chunk goes
+//     to the next rank only, through a fixed-size FIFO behind
+//     64-bit counters, in 2 * (world_size - 1) hops per loop.
 //
 // Unlike the previous implementation, the kernels carry no storage or IPC
 // logic: all pointers arrive via the communication planes (owned by Python)
@@ -38,6 +41,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
 
 // Kept out of sgl_kernel/utils.cuh: every JIT build's cache key covers that
 // header's contents, so an edit there rebuilds every CUDA kernel.
@@ -48,7 +52,7 @@
 
 namespace sglang {
 
-using device::distributed::PullWorkSpace, device::distributed::PushWorkSpace;
+using device::distributed::PullWorkSpace, device::distributed::PushWorkSpace, device::distributed::RingWorkSpace;
 using host::distributed::CommunicatorRef;
 
 inline constexpr uint32_t kMaxWorldSize = device::distributed::kMaxWorldSize;
@@ -60,6 +64,14 @@ struct AllReducePushParams {
   uint32_t num_vecs;
   uint32_t rank;
   PushWorkSpace<kWorldSize> ws;
+};
+
+struct AllReduceRingParams {
+  const void* __restrict__ input;
+  void* __restrict__ output;
+  uint32_t num_vecs;
+  uint32_t rank;
+  RingWorkSpace ws;
 };
 
 template <uint32_t kWorldSize>
@@ -327,6 +339,210 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_push_kernel(const __grid_constant__ AllR
   epoch.flip();
 }
 
+#ifdef USE_ROCM
+/// Threads per ring_simple channel, and 16-byte packs each thread keeps in
+/// flight per pass.
+inline constexpr uint32_t kRingSimpleThreads = 256;
+inline constexpr uint32_t kRingSimpleUnroll = 32;
+
+/// `vecs[u]` to `base` + u * kStride vectors as streaming system-scope stores,
+/// eight per `st_relaxed_nt_x8_16B`.
+template <uint32_t kStride, typename V, uint32_t... G>
+SGL_DEVICE void st_relaxed_nt_run(const V* vecs, void* base, std::integer_sequence<uint32_t, G...>) {
+  constexpr auto kStep = static_cast<int32_t>(kStride * sizeof(V));
+  (device::ptx::st_relaxed_nt_x8_16B<static_cast<int32_t>(G * 8) * kStep, kStep>(vecs + G * 8, base), ...);
+}
+
+/// What one ring hop does with each vector: receive it, add this rank's
+/// input, store it to the output, send it on.
+template <bool kRecv_, bool kReduce_, bool kStoreOut_, bool kSend_>
+struct RingHop {
+  static constexpr bool kRecv = kRecv_, kReduce = kReduce_, kStoreOut = kStoreOut_, kSend = kSend_;
+};
+
+/// The ring all-reduce: one channel per block,
+/// a FIFO of `num_slots` chunk-sized slices per channel in the next rank's
+/// memory, and per channel three 64-bit counters:
+/// `ready` (slices the predecessor published here), `drained` (slices the
+/// successor consumed) and `packet` (this rank's own count). A slice is plain
+/// data, published once all its stores have completed, so the receiver polls
+/// one counter and reads the payload once. The FIFO is cacheable memory read
+/// with system-scope loads: on MI450, reading uncached memory while the fabric
+/// writes into it caps a ring hop near 350 GB/s. Payload goes out as streaming
+/// system-scope stores, the output as streaming stores.
+///
+/// A channel is one block of 8 waves, at most 2 per SIMD; `amdgpu_waves_per_eu`
+/// says so, or the compiler budgets registers for more.
+template <typename T, uint32_t kWorldSize, bool kUsePDL>
+__global__ __launch_bounds__(kRingSimpleThreads, 1) __attribute__((
+    amdgpu_waves_per_eu(1, 2))) void all_reduce_ring_simple_kernel(const __grid_constant__ AllReduceRingParams params) {
+  using namespace device;
+  constexpr uint32_t kVecSize = 16 / (sizeof(T) * 2);
+  constexpr uint32_t kNumPackets = 2 * (kWorldSize - 1);
+  constexpr uint32_t kWarpVecs = kWarpThreads * kRingSimpleUnroll;
+  using vec_t = AlignedVector<packed_t<T>, kVecSize>;
+  const auto& ws = params.ws;
+  const auto r = params.rank;
+  const auto num_vecs = params.num_vecs;
+  const auto ch = blockIdx.x;
+  const auto num_channels = gridDim.x;
+  const auto lane_id = threadIdx.x % kWarpThreads;
+  const auto warp_id = threadIdx.x / kWarpThreads;
+  const auto num_warps = blockDim.x / kWarpThreads;
+  const auto slot_mask = ws.num_slots - 1;
+  const auto slot_vecs = ws.slot_bytes / 16;
+  const auto fifo_offset = ch * ws.num_slots * ws.slot_bytes;
+  const auto recv_fifo = ws.recv + fifo_offset;
+  const auto send_fifo = ws.send + fifo_offset;
+  auto& sem = ws.credits[ch];
+  auto& prev_sem = ws.prev_credits[ch];
+  auto& next_sem = ws.next_credits[ch];
+  const auto slot_of = [&](uint8_t* fifo, uint64_t p) { return fifo + (p & slot_mask) * ws.slot_bytes; };
+
+  PDLWaitPrimary<kUsePDL>();
+  uint64_t packet = sem.packet;
+  // polled by thread 0 only; the barrier after each wait publishes the result
+  uint64_t ready = 0, drained = 0;
+  const auto wait_until = [&](uint64_t& seen, const uint64_t* ptr, uint64_t target) {
+    while (seen < target) {
+      seen = ptx::load_acquire_sys(ptr);
+      if (seen < target) __builtin_amdgcn_s_sleep(1);
+    }
+  };
+  // Packet p may be received once the predecessor published it, and sent
+  // once the successor drained the packet that last held its slot.
+  const auto wait = [&](bool recv, uint64_t recv_p, bool send, uint64_t send_p) {
+    if (threadIdx.x == 0) {
+      if (recv) wait_until(ready, &sem.ready, recv_p + 1);
+      if (send && send_p >= ws.num_slots) wait_until(drained, &sem.drained, send_p + 1 - ws.num_slots);
+    }
+    __syncthreads();
+  };
+  // Once every wave's stores (and so the loads feeding them) completed: tell
+  // the predecessor `recv_p` is drained and the successor `send_p` is ready.
+  const auto post = [&](bool recv, uint64_t recv_p, bool send, uint64_t send_p) {
+    ptx::wait_stores_sys();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      if (recv) ptx::store_relaxed_sys(&prev_sem.drained, recv_p + 1);
+      if (send) ptx::store_relaxed_sys(&next_sem.ready, send_p + 1);
+    }
+  };
+  // One slice: warps take contiguous
+  // hunks of kWarpVecs, each lane a pack per kWarpThreads vectors, so a lane
+  // has kRingSimpleUnroll loads per source in flight. Only whole hunks take the
+  // unrolled path: a bounds check per pack splits it into branches the
+  // compiler fences with a full load wait each, serializing the loads.
+  const auto copy_packs =
+      [&](auto unroll, auto mode, const uint8_t* recv_slot, uint8_t* send_slot, uint32_t start, uint32_t j) {
+        constexpr uint32_t kUnroll = decltype(unroll)::value;
+        constexpr uint32_t kStride = kUnroll == 1 ? 1 : kWarpThreads;
+        constexpr bool kRecv = decltype(mode)::kRecv, kReduce = decltype(mode)::kReduce;
+        constexpr bool kStoreOut = decltype(mode)::kStoreOut, kSend = decltype(mode)::kSend;
+        // Per-lane base pointers with constant pack offsets, which fold into the
+        // instructions' immediate offsets: an index recomputed per pack reuses
+        // its VGPR, and each store then waits (s_wait_xcnt) for the last to read it.
+        const auto in = static_cast<const vec_t*>(params.input) + start + j;
+        const auto out = static_cast<vec_t*>(params.output) + start + j;
+        const auto recv_at = reinterpret_cast<const vec_t*>(recv_slot) + j;
+        const auto send_at = reinterpret_cast<vec_t*>(send_slot) + j;
+        vec_t vecs[kUnroll];
+        vec_t inputs[kUnroll];
+    // every pack of the local input, then every pack of the FIFO
+#pragma unroll
+        for (uint32_t u = 0; u < kUnroll; ++u) {
+          if constexpr (!kRecv || kReduce) inputs[u] = in[u * kStride];
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < kUnroll; ++u) {
+          if constexpr (kRecv) ptx::ld_sys_16B(vecs[u], recv_at, u * kStride);
+        }
+        // keep every load ahead of the first use: left alone, the scheduler pulls
+        // each reduction up behind its two loads and waits there, to save registers
+        __builtin_amdgcn_sched_barrier(0);
+    // results land in `vecs`; then the stores, one destination at a time
+#pragma unroll
+        for (uint32_t u = 0; u < kUnroll; ++u) {
+          if constexpr (kRecv && kReduce) {
+            vec_t pair[2];
+            pair[0] = vecs[u];
+            pair[1] = inputs[u];
+            vecs[u] = reduce_vec(pair);
+          } else if constexpr (!kRecv) {
+            vecs[u] = inputs[u];
+          }
+        }
+        if constexpr (kStoreOut) {
+#pragma unroll
+          for (uint32_t u = 0; u < kUnroll; ++u)
+            ptx::st_nontemporal_16B(vecs[u], out, u * kStride);
+        }
+        if constexpr (kSend) {
+          if constexpr (kUnroll % 8 == 0) {
+            st_relaxed_nt_run<kStride>(vecs, send_at, std::make_integer_sequence<uint32_t, kUnroll / 8>{});
+          } else {
+#pragma unroll
+            for (uint32_t u = 0; u < kUnroll; ++u)
+              ptx::st_relaxed_16B(vecs[u], send_at, u * kStride);
+          }
+        }
+      };
+  const auto copy = [&](auto mode, const uint8_t* recv_slot, uint8_t* send_slot, uint32_t start, uint32_t n) {
+    const auto full = n / kWarpVecs * kWarpVecs;
+    for (uint32_t base = warp_id * kWarpVecs; base < full; base += num_warps * kWarpVecs) {
+      copy_packs(
+          std::integral_constant<uint32_t, kRingSimpleUnroll>{}, mode, recv_slot, send_slot, start, base + lane_id);
+    }
+    for (uint32_t j = full + threadIdx.x; j < n; j += blockDim.x) {
+      copy_packs(std::integral_constant<uint32_t, 1>{}, mode, recv_slot, send_slot, start, j);
+    }
+  };
+
+  // each channel takes a contiguous share of the tensor, then loops over it in
+  // kWorldSize chunks of at most one slot
+  const auto channel_vecs = div_ceil(num_vecs, num_channels);
+  const auto channel_start = min(ch * channel_vecs, num_vecs);
+  const auto channel_len = min(channel_vecs, num_vecs - channel_start);
+  const auto loop_vecs = kWorldSize * slot_vecs;
+  for (uint32_t base = 0; base < channel_len; base += loop_vecs) {
+    const auto len = min(loop_vecs, channel_len - base);
+    const auto chunk_vecs = div_ceil(len, kWorldSize);
+    const auto chunk_start = [&](uint32_t c) { return channel_start + base + c * chunk_vecs; };
+    const auto chunk_len = [&](uint32_t c) { return min(chunk_vecs, len - min(len, c * chunk_vecs)); };
+
+    // first hop: this rank's own chunk
+    wait(false, 0, true, packet);
+    copy(RingHop<false, false, false, true>{}, nullptr, slot_of(send_fifo, packet), chunk_start(r), chunk_len(r));
+    post(false, 0, true, packet);
+
+    // hop q receives chunk r - 1 - q: a partial for q < kWorldSize - 1, which
+    // this rank completes at q = kWorldSize - 2, then a reduced chunk
+    for (uint32_t q = 0; q < kNumPackets; ++q, ++packet) {
+      const bool forward = q + 1 < kNumPackets;
+      const auto c = (r + 2 * kWorldSize - 1 - q) % kWorldSize;
+      const auto recv_slot = slot_of(recv_fifo, packet);
+      const auto send_slot = slot_of(send_fifo, packet + 1);
+      const auto start = chunk_start(c);
+      const auto n = chunk_len(c);
+      wait(true, packet, forward, packet + 1);
+      if (q + 2 < kWorldSize) {
+        copy(RingHop<true, true, false, true>{}, recv_slot, send_slot, start, n);
+      } else if (q + 2 == kWorldSize) {
+        copy(RingHop<true, true, true, true>{}, recv_slot, send_slot, start, n);
+      } else if (forward) {
+        copy(RingHop<true, false, true, true>{}, recv_slot, send_slot, start, n);
+      } else {
+        copy(RingHop<true, false, true, false>{}, recv_slot, send_slot, start, n);
+      }
+      post(true, packet, forward, packet + 1);
+    }
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+  if (threadIdx.x == 0) sem.packet = packet;
+}
+#endif
+
 template <typename Impl, typename T, uint32_t kWorldSize, bool kUsePDL>
 ALL_REDUCE_KERNEL void all_reduce_1shot_pull_kernel(const __grid_constant__ AllReducePullParams<kWorldSize> params) {
   using namespace device;
@@ -451,7 +667,10 @@ struct AllReduceKernel {
       const bool use_multicast) {
     using namespace host;
     const auto& comm = *comm_ref.get();
-    CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push") << algo;
+    CHECK_HOST(
+        algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push" ||
+        algo == "ring_simple")
+        << algo;
     CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
     CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLGPU);
     const auto num_elems_int64 = in.numel();
@@ -462,6 +681,27 @@ struct AllReduceKernel {
     const auto num_vecs = static_cast<uint32_t>(num_elems / (16 / sizeof(T)));
     const auto stream = LaunchKernel::resolve_device(in.device());
     const auto use_graph = graph_params_opt.has_value();
+
+    if (algo == "ring_simple") {
+      CHECK_HOST(!use_graph && !use_multicast);
+#ifdef USE_ROCM
+      CHECK_HOST(is_gfx1250()) << "The ring all-reduce is only enabled on gfx1250";
+      const auto& ring = comm.get_ring_simple_obj();
+      Tensor out = ffi::empty_like(in);
+      const auto params = AllReduceRingParams{
+          .input = in.data_ptr(),
+          .output = out.data_ptr(),
+          .num_vecs = num_vecs,
+          .rank = ring.rank,
+          .ws = ring.get_workspace(),
+      };
+      LaunchKernel(ring.num_rings, kRingSimpleThreads, stream)  //
+          .enable_pdl(kUsePDL)(all_reduce_ring_simple_kernel<T, kWorldSize, kUsePDL>, params);
+      return out;
+#else
+      Panic("The ring all-reduce is only enabled on ROCm gfx1250");
+#endif
+    }
 
     if (algo == "1shot_push" || algo == "2shot_push") {
       CHECK_HOST(!use_graph && !use_multicast);
