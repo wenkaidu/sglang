@@ -43,6 +43,7 @@ from sglang.kernels.ops.communication.all_reduce import (
     IPCManager,
     PullPlane,
     PushPlane,
+    RingPlane,
     custom_all_reduce,
     custom_pair_stage,
     get_all_reduce_module,
@@ -83,6 +84,9 @@ MB = 1024 * 1024
 
 _ALIGN_BYTES = 1024
 _SEMAPHORE_BYTES = 128
+# a ring_simple channel double-buffers its chunks: two 2 MB slices
+_RING_SIMPLE_SLOTS = 2
+_RING_SIMPLE_BUFFER_SIZE = 4 * MB
 _MAX_GRAPH_INPUTS = 131072
 # resolved once at import time; explicit constructor sizes take precedence
 _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
@@ -136,9 +140,16 @@ def _fit_hier(config, hier_max: int):
 
 
 def _allocate_symmetric_memory(
-    nbytes: int, device: torch.device, group: ProcessGroup, multinode: bool = False
+    nbytes: int,
+    device: torch.device,
+    group: ProcessGroup,
+    multinode: bool = False,
 ) -> Tuple[object, List[torch.Tensor], int]:
-    """``(owner, per-rank uint8 views, multicast VA or 0)``; keep ``owner`` alive."""
+    """``(owner, per-rank uint8 views, multicast VA or 0)``; keep ``owner`` alive.
+
+    ROCm gets one uncached VMM allocation. Kernels poll peer writes inside a
+    launch, which a cached L2 would hide.
+    """
     if _is_hip:
         from sglang.srt.utils.hip_vmm_utils import HipSymmetricBuffer
 
@@ -183,6 +194,7 @@ class CustomAllReduceV2:
         max_push_size: Optional[int] = None,
         max_pull_blocks: Optional[int] = None,
         max_push_blocks: Optional[int] = None,
+        ring_simple_buffer_size: int = _RING_SIMPLE_BUFFER_SIZE,
     ) -> None:
         """
         :param max_size: direction-agnostic memory cap. Each workspace is
@@ -196,6 +208,10 @@ class CustomAllReduceV2:
                               overrides both the tuned size and ``max_size``.
         :param max_pull_blocks: cap on the barrier plane's block count; ``0``
                                 builds a push-only instance.
+        :param ring_simple_buffer_size: FIFO bytes per channel of the ring
+                                 all-reduce (``ring_simple``, where the tuned
+                                 config enables it: ROCm gfx1250): two
+                                 chunk-sized slices.
 
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB`` /
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB`` take the highest
@@ -273,6 +289,24 @@ class CustomAllReduceV2:
             max_pull_bytes=self.max_pull_size,
             world_size=self.world_size,
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
+        # the ring plane exists only where the tuned table picks ring_simple
+        self.num_ring_simple_channels = self.config.num_ring_simple_channels
+        uses_ring = any(
+            h.ring_simple.max_bytes > 0 for h in (self.config.graph, self.config.eager)
+        )
+        self.ring_simple_slot_bytes = (
+            _ceil_align(ring_simple_buffer_size // _RING_SIMPLE_SLOTS, 16)
+            if uses_ring
+            and self.num_ring_simple_channels
+            and ring_simple_buffer_size > 0
+            else 0
+        )
+        self.ring_simple_enabled = self.ring_simple_slot_bytes > 0
+        if not self.ring_simple_enabled:
+            self.config = self.config._replace(
+                graph=self.config.graph._replace(ring_simple=Range(0, 0)),
+                eager=self.config.eager._replace(ring_simple=Range(0, 0)),
+            )
         self.override_algo: Optional[AllReduceAlgo] = None
         # (nbytes, dtype) -> (module, algo name, multicast) or None, for
         # eager calls under `_eager_plans_config`; rebuilt when config changes.
@@ -352,14 +386,14 @@ class CustomAllReduceV2:
         self._init_workspace()
 
     def _init_workspace(self) -> None:
-        """Slice one symmetric-memory allocation into every shared buffer.
+        """Slice one uncached symmetric-memory allocation into every shared buffer.
 
         Layout per rank: ``[2 * world_size push slots | pull buffer | pull
-        semaphores | 2 * 2 pair slots | 2 * world_size / 2 cross slots]``; the
-        pair and cross slots exist only with hier_2shot_push. One allocation
-        rather than several keeps it to a single rendezvous and a single
-        multicast base to offset from. The push counters are rank-local, so
-        they live in plain CUDA tensors.
+        semaphores | 2 * 2 pair slots | 2 * world_size / 2 cross slots | ring
+        semaphores | ring FIFO]``; the pair, cross and ring regions exist only
+        with their algo. One allocation keeps it to a single rendezvous and a
+        single multicast base to offset from. The push counters are rank-local,
+        so they live in plain CUDA tensors.
         """
         cfg = self.config
         push_num_slots = 2 * self.world_size  # 2 phases x world_size peers
@@ -376,11 +410,19 @@ class CustomAllReduceV2:
         )
         pair_bytes = 2 * 2 * pair_slot if self.hier_max_size else 0
         cross_bytes = 2 * cross_world * cross_slot if self.hier_max_size else 0
+        num_channels = self.num_ring_simple_channels
+        simple_shape = [num_channels, _RING_SIMPLE_SLOTS, self.ring_simple_slot_bytes]
+        simple_bytes = simple_shape[0] * simple_shape[1] * simple_shape[2]
+        simple_sem_bytes = (
+            _SEMAPHORE_BYTES * num_channels if self.ring_simple_enabled else 0
+        )
         pull_offset = push_bytes
         sem_offset = push_bytes + pull_bytes
         pair_offset = sem_offset + sem_bytes
         cross_offset = pair_offset + pair_bytes
-        total_bytes = cross_offset + cross_bytes
+        simple_sem_offset = cross_offset + cross_bytes
+        simple_offset = simple_sem_offset + simple_sem_bytes
+        total_bytes = simple_offset + simple_bytes
 
         self._symm_owner, slabs, multicast_ptr = _allocate_symmetric_memory(
             total_bytes,
@@ -389,8 +431,8 @@ class CustomAllReduceV2:
             multinode=self._is_multinode,
         )
         # The push slots (lamport pos-zero markers) and the semaphores must
-        # start zeroed; the pull buffer need not, but it rides along in the
-        # one-shot memset.
+        # start zeroed; the pull buffer and the ring FIFO need not, but they
+        # ride along in the one-shot memset.
         slabs[self.rank].zero_()
         torch.cuda.synchronize()
         dist.barrier(group=self.group)
@@ -432,6 +474,16 @@ class CustomAllReduceV2:
                 mc_workspace=mc_at(pull_offset),
                 mc_semaphore=mc_at(sem_offset),
             )
+        ring_simple_plane = None
+        if self.ring_simple_enabled:
+            ring_simple_plane = RingPlane(
+                self.rank,
+                self.world_size,
+                workspaces=slice_all(simple_shape, simple_offset),
+                semaphores=slice_all(
+                    [num_channels, _SEMAPHORE_BYTES], simple_sem_offset
+                ),
+            )
         if not self.has_multicast or not self.pull_enabled:
             self.config = self.config._replace(num_mc_blocks=None)
 
@@ -470,19 +522,22 @@ class CustomAllReduceV2:
                 cross, cross_offset, cross_slot, self._hier_counters[1]
             )
 
-        self.obj = Communicator(push=push_plane, pull=pull_plane)
+        self.obj = Communicator(
+            push=push_plane, pull=pull_plane, ring_simple=ring_simple_plane
+        )
         if self.config.num_mc_blocks is not None:
             self.obj.set_pull_multicast_blocks(self.config.num_mc_blocks)
         if self.rank == 0:
             logger.info(
                 "All Reduce config: symmetric_memory = %.2f MB, "
                 "local_buffer = %.2f MB, multicast = %s, pull = %s, "
-                "hier_2shot_push = %s",
+                "hier_2shot_push = %s, ring_simple = %s",
                 total_bytes / MB,
                 (self.graph_params.nbytes + self._push_counter.nbytes) / MB,
                 self.config.num_mc_blocks is not None,
                 self.pull_enabled,
                 self._dpx_pairs if self.hier_max_size else None,
+                simple_shape if self.ring_simple_enabled else None,
             )
         dist.barrier(group=self.group)
 
@@ -537,6 +592,8 @@ class CustomAllReduceV2:
             return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_multicast=True)
         if nbytes <= heuristic.two_shot_pull_threshold:
             return AllReduceConfig(AllReduceAlgo.TWO_SHOT_PULL, use_graph=can_use_graph)
+        if heuristic.ring_simple.contains(nbytes):
+            return AllReduceConfig(AllReduceAlgo.RING_SIMPLE)
         return None
 
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
@@ -554,6 +611,8 @@ class CustomAllReduceV2:
         if self.override_algo is not None:
             if self.override_algo == AllReduceAlgo.HIER_2SHOT_PUSH:
                 return inp_size % 32 == 0 and inp_size <= self.hier_max_size
+            if self.override_algo == AllReduceAlgo.RING_SIMPLE:
+                return self.ring_simple_enabled
             return inp_size <= self.max_size
         if not self._graph_mode_allowed:
             return self._eager_plan(inp_size, inp.dtype) is not None
